@@ -1,0 +1,6 @@
+{
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "mailbox": "INBOX",
+  "days_back": 30
+}

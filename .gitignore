@@ -1,0 +1,31 @@
+# Footing System – dane prywatne i inbox (nigdy w Git)
+00-inbox/
+02-output-private/
+
+# Pliki danych
+*.csv
+*.xml
+*.vcf
+*.eml
+*.mbox
+*.xlsx
+
+# Konfiguracja lokalna
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Tymczasowe / locki
+*.tmp
+*.bak
+*.new
+~$*
+.~lock*
+_migracja-*.txt
+
+# Stare ścieżki (do usunięcia po migracji)
+10-sms/
+06-raporty/
