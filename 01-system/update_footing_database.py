@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import html
 import json
+import quopri
 import re
 import sys
 import urllib.request
@@ -303,59 +305,322 @@ def contact_creates_order(pc: ParsedContact) -> bool:
     return bool(pc.data_zamowienia and (pc.items or QTY_SZT_RE.search(pc.surowa)))
 
 
-def load_contacts_tab(path: Path) -> dict[str, ParsedContact]:
+VCARD_CHARSETS = {
+    "UTF-8": "utf-8",
+    "UTF8": "utf-8",
+    "ISO-8859-2": "iso-8859-2",
+    "ISO8859-2": "iso-8859-2",
+    "LATIN2": "iso-8859-2",
+    "WINDOWS-1250": "cp1250",
+    "CP1250": "cp1250",
+}
+VCARD_CHARSET_FALLBACKS = ("utf-8", "cp1250", "iso-8859-2")
+SUSPICIOUS_VCF_MARKERS = ("\ufffd", "Ã", "Å", "Ä", "=C", "=D", "=E", "=F")
+DIAG_VCF_COLS = [
+    "telefon", "nazwa_surowa", "nazwa_zdekodowana", "encoding", "charset", "czy_podejrzana",
+]
+
+
+def normalize_vcard_charset(charset: str) -> str:
+    key = (charset or "").strip().upper().replace("_", "-")
+    return VCARD_CHARSETS.get(key, charset.lower())
+
+
+def detect_file_charset(raw: bytes) -> str:
+    for enc in VCARD_CHARSET_FALLBACKS:
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError:
+            continue
+    return "utf-8"
+
+
+def decode_bytes_with_charset(data: bytes, charset: str | None) -> str:
+    if charset:
+        enc = normalize_vcard_charset(charset)
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            pass
+    for enc in VCARD_CHARSET_FALLBACKS:
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def parse_vcard_params(param_part: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for piece in param_part.split(";"):
+        piece = piece.strip()
+        if not piece:
+            continue
+        if "=" in piece:
+            key, val = piece.split("=", 1)
+            params[key.upper()] = val
+        else:
+            params[piece.upper()] = ""
+    return params
+
+
+def parse_vcard_property(line: str) -> tuple[str, dict[str, str], str]:
+    if ":" not in line:
+        return "", {}, line
+    head, value = line.split(":", 1)
+    parts = head.split(";")
+    prop = parts[0].split(".")[-1].upper()
+    params = parse_vcard_params(";".join(parts[1:]))
+    return prop, params, value
+
+
+def decode_vcard_value(value: str, params: dict[str, str] | None = None) -> str:
+    if not value:
+        return value
+    params = params or {}
+    encoding = params.get("ENCODING", "").upper()
+    charset = params.get("CHARSET", "")
+
+    if encoding in ("QUOTED-PRINTABLE", "QP"):
+        raw_bytes = quopri.decodestring(value.encode("ascii", errors="replace"))
+        return decode_bytes_with_charset(raw_bytes, charset or None)
+
+    if encoding == "BASE64":
+        raw_bytes = base64.b64decode("".join(value.split()))
+        return decode_bytes_with_charset(raw_bytes, charset or None)
+
+    return value
+
+
+def is_suspicious_vcf_name(name: str) -> bool:
+    return any(marker in name for marker in SUSPICIOUS_VCF_MARKERS)
+
+
+def unfold_vcard_byte_lines(raw_lines: list[bytes]) -> list[bytes]:
+    unfolded: list[bytes] = []
+    for line in raw_lines:
+        if line and line[:1] in (b" ", b"\t") and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    return unfolded
+
+
+def unfold_vcard_lines(lines: list[str]) -> list[str]:
+    unfolded: list[str] = []
+    for line in lines:
+        if line and line[0] in " \t" and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    return unfolded
+
+
+def read_vcard_file_lines(path: Path) -> tuple[list[str], str]:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    physical = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+    unfolded = unfold_vcard_byte_lines(physical)
+    file_charset = detect_file_charset(raw)
+    lines = [decode_bytes_with_charset(line, file_charset) if line else "" for line in unfolded]
+    return lines, file_charset
+
+
+def format_vcard_name(n_value: str, n_params: dict[str, str]) -> str:
+    decoded = decode_vcard_value(n_value, n_params)
+    parts = decoded.split(";")
+    while len(parts) < 5:
+        parts.append("")
+    family, given, additional, prefix, suffix = parts[:5]
+    pieces = [prefix, given, additional, family, suffix]
+    return " ".join(p for p in pieces if p).strip()
+
+
+def is_vcard_format(lines: list[str]) -> bool:
+    return any(line.strip().upper() == "BEGIN:VCARD" for line in lines)
+
+
+def make_vcf_diagnostic(
+    telefon: str,
+    raw_name: str,
+    decoded_name: str,
+    encoding: str,
+    charset: str,
+) -> dict[str, str]:
+    return {
+        "telefon": telefon,
+        "nazwa_surowa": raw_name,
+        "nazwa_zdekodowana": decoded_name,
+        "encoding": encoding,
+        "charset": charset,
+        "czy_podejrzana": "tak" if is_suspicious_vcf_name(decoded_name) else "nie",
+    }
+
+
+def load_contacts_tab(lines: list[str], file_charset: str) -> tuple[dict[str, ParsedContact], list[dict]]:
     contacts: dict[str, ParsedContact] = {}
-    for line in path.read_text(encoding="utf-8").splitlines()[1:]:
+    diagnostics: list[dict] = []
+    for line in lines[1:]:
         if not line.strip() or line.startswith("Opis"):
             continue
         parts = line.split("\t")
         if len(parts) < 2:
             continue
-        parsed = parse_contact_name(parts[0])
+        raw_name = parts[0].strip()
+        decoded_name = decode_vcard_value(raw_name, {})
+        parsed = parse_contact_name(decoded_name)
         for p in re.split(r",\s*", parts[1]):
             phone = normalize_phone(p.strip())
             if phone and not is_internal_phone(phone):
                 old = contacts.get(phone)
                 if not old or parsed.data_zamowienia >= old.data_zamowienia:
                     contacts[phone] = parsed
-    return contacts
+                diagnostics.append(make_vcf_diagnostic(
+                    phone, raw_name, decoded_name, "", file_charset,
+                ))
+    return contacts, diagnostics
 
 
-def load_contacts_vcard(path: Path) -> dict[str, ParsedContact]:
+def load_contacts_vcard(lines: list[str]) -> tuple[dict[str, ParsedContact], list[dict]]:
     contacts: dict[str, ParsedContact] = {}
+    diagnostics: list[dict] = []
     block: list[str] = []
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in lines:
         if line.strip().upper() == "BEGIN:VCARD":
             block = [line]
             continue
         if not block:
-            if "\t" in line and not line.startswith("Opis"):
-                return load_contacts_tab(path)
             continue
         block.append(line)
-        if line.strip().upper() == "END:VCARD":
-            fn, tel = "", ""
-            for ln in block:
-                if ln.upper().startswith("FN:"):
-                    fn = ln[3:].strip()
-                elif ln.upper().startswith("TEL"):
-                    tel = ln.split(":", 1)[-1].strip()
-            phone = normalize_phone(tel)
-            if phone and fn and not is_internal_phone(phone):
-                parsed = parse_contact_name(fn)
+        if line.strip().upper() != "END:VCARD":
+            continue
+
+        fn_raw, fn_decoded, fn_params = "", "", {}
+        n_raw, n_params = "", {}
+        phones: list[tuple[str, str, dict[str, str]]] = []
+        for ln in block:
+            prop, params, value = parse_vcard_property(ln.strip())
+            if prop == "FN":
+                fn_raw, fn_params = value, params
+                fn_decoded = decode_vcard_value(value, params)
+            elif prop == "N":
+                n_raw, n_params = value, params
+            elif prop == "TEL":
+                phones.append((value, decode_vcard_value(value, params), params))
+            elif prop == "EMAIL":
+                pass
+
+        if fn_decoded:
+            name_raw, name_decoded = fn_raw, fn_decoded
+            name_enc = fn_params.get("ENCODING", "")
+            name_cs = fn_params.get("CHARSET", "")
+        elif n_raw:
+            name_raw = n_raw
+            name_decoded = format_vcard_name(n_raw, n_params)
+            name_enc = n_params.get("ENCODING", "")
+            name_cs = n_params.get("CHARSET", "")
+        else:
+            block = []
+            continue
+
+        parsed = parse_contact_name(name_decoded)
+        for tel_raw, tel_decoded, _tel_params in phones:
+            phone = normalize_phone(tel_decoded or tel_raw)
+            if phone and not is_internal_phone(phone):
                 old = contacts.get(phone)
                 if not old or parsed.data_zamowienia >= old.data_zamowienia:
                     contacts[phone] = parsed
-            block = []
-    return contacts
+                diagnostics.append(make_vcf_diagnostic(
+                    phone, name_raw, name_decoded, name_enc, name_cs,
+                ))
+        block = []
+    return contacts, diagnostics
 
 
-def load_contacts() -> dict[str, ParsedContact]:
+def write_vcf_diagnostics(diagnostics: list[dict]) -> Path:
+    OUT_PRIVATE.mkdir(parents=True, exist_ok=True)
+    path = OUT_PRIVATE / "DIAGNOSTYKA-VCF.csv"
+    write_csv(path, DIAG_VCF_COLS, diagnostics)
+    return path
+
+
+def assert_vcard_decode_self_test() -> None:
+    assert decode_vcard_value("Jan Kowalski", {}) == "Jan Kowalski"
+    assert decode_vcard_value(
+        "=C5=81=C3=B3d=C5=BA",
+        {"ENCODING": "QUOTED-PRINTABLE", "CHARSET": "UTF-8"},
+    ) == "\u0141\u00f3d\u017a"
+    assert decode_vcard_value(
+        "Krak=F3w",
+        {"ENCODING": "QUOTED-PRINTABLE", "CHARSET": "WINDOWS-1250"},
+    ) == "Krak\u00f3w"
+    assert decode_vcard_value(
+        "Krak=F3w",
+        {"ENCODING": "QUOTED-PRINTABLE", "CHARSET": "ISO-8859-2"},
+    ) == "Krak\u00f3w"
+    assert decode_vcard_value("=C5=81", {"ENCODING": "QP", "CHARSET": "UTF-8"}) == "\u0141"
+
+    folded = unfold_vcard_lines([
+        "FN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=C5=81=C3=B3",
+        " d=C5=BA",
+    ])
+    _, params, value = parse_vcard_property(folded[0])
+    assert decode_vcard_value(value, params) == "\u0141\u00f3d\u017a"
+
+    assert decode_vcard_value("4xZ25=4B160 Ogrodzenie", {}) == "4xZ25=4B160 Ogrodzenie"
+
+
+def load_contacts_google_cache(path: Path) -> tuple[dict[str, ParsedContact], list[dict]]:
+    contacts: dict[str, ParsedContact] = {}
+    diagnostics: list[dict] = []
+    with path.open(encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            name = (row.get("nazwa_kontaktu") or "").strip()
+            if not name:
+                name = " ".join(
+                    p for p in (
+                        (row.get("imie") or "").strip(),
+                        (row.get("nazwisko") or "").strip(),
+                        (row.get("firma") or "").strip(),
+                    ) if p
+                ).strip()
+            if not name:
+                continue
+            parsed = parse_contact_name(name)
+            phone_raw = (row.get("telefon") or "").strip()
+            if not phone_raw:
+                continue
+            phone = normalize_phone(phone_raw)
+            if phone and not is_internal_phone(phone):
+                old = contacts.get(phone)
+                if not old or parsed.data_zamowienia >= old.data_zamowienia:
+                    contacts[phone] = parsed
+    return contacts, diagnostics
+
+
+def load_contacts() -> tuple[dict[str, ParsedContact], list[dict], str]:
+    cache_path = INBOX / "contacts_cache.csv"
+    if cache_path.exists():
+        contacts, diagnostics = load_contacts_google_cache(cache_path)
+        print(f"Kontakty: źródło google_contacts_cache ({cache_path.name})")
+        return contacts, diagnostics, "google_contacts_cache"
+
     path = INBOX / "contacts.vcf"
     if not path.exists():
-        print(f"Brak pliku: {path}")
-        return {}
-    return load_contacts_vcard(path)
+        print("Brak contacts_cache.csv i contacts.vcf")
+        return {}, [], "brak"
+
+    print(f"Kontakty: źródło contacts_vcf_fallback ({path.name})")
+    lines, file_charset = read_vcard_file_lines(path)
+    if is_vcard_format(lines):
+        contacts, diagnostics = load_contacts_vcard(lines)
+    elif any("\t" in line for line in lines[:3]):
+        contacts, diagnostics = load_contacts_tab(lines, file_charset)
+    else:
+        contacts, diagnostics = load_contacts_vcard(lines)
+    return contacts, diagnostics, "contacts_vcf_fallback"
 
 
 def decode_sms_body(body: str) -> str:
@@ -605,6 +870,7 @@ def write_public_reports(stats: dict) -> None:
 
     (REPORTS / "PODSUMOWANIE.md").write_text(
         f"# Footing System – podsumowanie\n\nWygenerowano: {now}\n\n"
+        f"- Źródło kontaktów: **{stats.get('contacts_source', 'brak')}**\n"
         f"- Klienci: **{stats['clients']}**\n"
         f"- Zamówienia: **{stats['orders']}**\n"
         f"- Pozycje: **{stats['items']}**\n"
@@ -704,6 +970,7 @@ def assert_contact_parser_self_test() -> None:
 
 def main() -> int:
     assert_contact_parser_self_test()
+    assert_vcard_decode_self_test()
     cfg = load_config()
     INBOX.mkdir(parents=True, exist_ok=True)
     OUT_PRIVATE.mkdir(parents=True, exist_ok=True)
@@ -720,11 +987,17 @@ def main() -> int:
         if added:
             print(f"IMAP: zapisano {added} nowych e-maili do cache")
 
-    vcf = load_contacts()
+    contacts, vcf_diagnostics, contacts_source = load_contacts()
+    if contacts_source == "contacts_vcf_fallback":
+        diag_path = write_vcf_diagnostics(vcf_diagnostics)
+        suspicious_count = sum(1 for d in vcf_diagnostics if d["czy_podejrzana"] == "tak")
+        print(f"VCF: zdekodowano {len(vcf_diagnostics)} kontaktów, podejrzanych: {suspicious_count}")
+        print(f"VCF diagnostyka: {diag_path}")
+
     sms_list = load_sms()
     email_list = load_email_cache()
     all_comm = sms_list + email_list
-    print(f"Kontakty: {len(vcf)} | SMS: {len(sms_list)} | E-mail cache: {len(email_list)}")
+    print(f"Kontakty: {len(contacts)} | SMS: {len(sms_list)} | E-mail cache: {len(email_list)}")
 
     reviews: list[dict] = []
     orders: list[dict] = []
@@ -732,7 +1005,7 @@ def main() -> int:
     phone_to_order: dict[str, str] = {}
     order_seq = item_seq = 0
 
-    for phone, pc in sorted(vcf.items()):
+    for phone, pc in sorted(contacts.items()):
         if not contact_creates_order(pc):
             if pc.surowa:
                 reviews.append({
@@ -828,13 +1101,13 @@ def main() -> int:
         })
 
     client_orders = Counter(o["klient_id"] for o in orders)
-    all_phones = set(vcf.keys()) | {m.telefon for m in all_comm if m.telefon and not m.wewnetrzny}
+    all_phones = set(contacts.keys()) | {m.telefon for m in all_comm if m.telefon and not m.wewnetrzny}
     clients: list[dict] = []
 
     for phone in sorted(all_phones):
         if is_internal_phone(phone):
             continue
-        pc = vcf.get(phone)
+        pc = contacts.get(phone)
         kid = klient_id_from_phone(phone)
         dates = sorted(set(client_dates.get(kid, []) + ([pc.data_zamowienia] if pc and pc.data_zamowienia else [])))
         prods = [f"{it.ilosc}x{it.kod_pelny}" for it in pc.items] if pc else []
@@ -843,7 +1116,7 @@ def main() -> int:
         if pc and not pc.pewny:
             status, uwagi = "do_sprawdzenia", "; ".join(pc.uwagi)
         elif not pc:
-            status, uwagi = "do_sprawdzenia", "brak nazwy kontaktu w VCF"
+            status, uwagi = "do_sprawdzenia", "brak nazwy kontaktu w cache"
 
         clients.append({
             "klient_id": kid, "telefon": phone,
@@ -870,9 +1143,9 @@ def main() -> int:
         if o.get("zastosowanie"):
             rank_apps[o["zastosowanie"].lower()] += 1
 
-    seo_rows = build_seo_rows(komunikacja, vcf)
+    seo_rows = build_seo_rows(komunikacja, contacts)
     segment_rows = build_segments(clients, orders)
-    email_contact_rows = build_email_contacts(komunikacja, vcf)
+    email_contact_rows = build_email_contacts(komunikacja, contacts)
 
     write_csv(OUT_PRIVATE / "KLIENCI.csv", CLIENT_COLS, clients)
     write_csv(OUT_PRIVATE / "ZAMOWIENIA.csv", ORDER_COLS, orders)
@@ -888,6 +1161,7 @@ def main() -> int:
         "komunikacja": len(komunikacja), "reviews": len(reviews), "excluded": excluded,
         "rank_qty": rank_qty.most_common(), "rank_apps": rank_apps.most_common(),
         "rank_seo": Counter(r["fraza"] for r in seo_rows).most_common(),
+        "contacts_source": contacts_source,
     }
     write_public_reports(stats)
     send_slack(cfg, stats)

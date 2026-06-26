@@ -1,11 +1,11 @@
 # Footing System – podsumowanie
 
-Wygenerowano: 2026-06-25 19:04
+Wygenerowano: 2026-06-25 19:43
 
 - Klienci: **265**
 - Zamówienia: **192**
 - Pozycje: **214**
-- Komunikacja: **491**
+- Komunikacja: **665**
 - Do sprawdzenia: **47**
 - Wykluczone wewnętrzne: **20**
 

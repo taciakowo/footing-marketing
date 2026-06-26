@@ -1,6 +1,6 @@
 # Produkcja – zapotrzebowanie
 
-Ostatnia aktualizacja: 2026-06-25 19:04
+Ostatnia aktualizacja: 2026-06-25 19:43
 
 ## Szacunkowe ilości do produkcji (z zamówień)
 
