@@ -1,42 +1,42 @@
 # Footing System – podsumowanie
 
-Wygenerowano: 2026-06-25 19:43
+Wygenerowano: 2026-06-27 15:23
 
-- Klienci: **265**
-- Zamówienia: **192**
-- Pozycje: **214**
-- Komunikacja: **665**
-- Do sprawdzenia: **47**
+- Źródło kontaktów: **google_contacts_cache**
+- Klienci: **171**
+- Zamówienia: **171**
+- Pozycje: **203**
+- Komunikacja: **674**
+- Do sprawdzenia: **16**
 - Wykluczone wewnętrzne: **20**
 
 ## Ranking produktów (sztuki)
 
 | Produkt | Sztuki |
 |---------|--------|
-| Z25-M20 | 127 |
-| Z25-K130 | 103 |
-| Z25-K160 | 97 |
-| Z26-S2 | 85 |
-| Z26-S1 | 65 |
-| Z25-K100 | 46 |
-| Z25-K160U | 41 |
-| Z25-K110 | 36 |
-| K210 | 28 |
-| W35-K130 | 27 |
-| Z25-P96-175 | 27 |
+| Z25 | 703 |
+| Z26 | 284 |
+| W35 | 41 |
+| Z17 | 40 |
 | K98 | 25 |
-| Z25-K130W | 24 |
-| Z25-K130U | 24 |
-| Z25-R150 | 24 |
+| K2 | 23 |
+| K1 | 18 |
+| Z255 | 16 |
+| K148 | 13 |
+| 13 4szt | 13 |
+| H2 | 10 |
+| K118 | 7 |
+| Z16 | 2 |
+| K16 | 0 |
 
 ## Ranking zastosowań
 
-- pergole: 3
-- wiata: 1
+- słupy: 1
+- słupki: 1
+- pergole: 1
 - słup: 1
-- zadaszenie: 1
 - ogrodzenie: 1
 - fotowoltaika: 1
-- słupki: 1
-- pergolę: 1
-- pergoli: 1
+- szlabanów: 1
+- wiata: 1
+- zadaszenie: 1

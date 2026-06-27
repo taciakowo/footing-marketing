@@ -117,7 +117,7 @@ footing-system/
 | **Google Contacts (cache)** | Główne: nazwa kontaktu → data, produkty, ilości, zastosowanie |
 | **contacts.vcf** | Awaryjne, gdy brak cache Google |
 | **SMS / e-mail** | Pomocnicze: adres, kwota, e-mail – **bez nadpisywania** kontaktu |
-| **+48888338495** | Numer firmowy – wykluczony z klientów i zamówień |
+| **+48********* | Numer firmowy – wykluczony z klientów i zamówień |
 
 ### Przykład nazwy kontaktu
 
