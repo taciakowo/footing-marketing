@@ -91,6 +91,20 @@ BREVO_CEIDG_COLS = [
 REVIEW_COLS = [
     "powod", "nazwa_firmy", "email", "telefon", "strona_www", "pkd", "segment", "sugestia", "uwagi",
 ]
+PRIORITY_AUDIT_COLS = [
+    "email", "nazwa_firmy", "imie", "nazwisko", "segment", "priorytet",
+    "priorytet_score", "priorytet_segment", "priorytet_powody",
+    "trafienia_slowa", "trafienia_pola", "podejrzenie_false_positive",
+]
+
+BUSINESS_SCORE_FIELDS = (
+    "nazwa_firmy", "pkd", "pkd_opis", "strona_www", "opis_dzialalnosci",
+)
+PERSONAL_NAME_FIELDS = frozenset({"imie", "nazwisko"})
+POLISH_INFLECTION_SUFFIX = (
+    r"ami|ach|ów|ow|owych|owej|owym|em|om|"
+    r"y|i|e|a|u|ie|ne|na|ny|nych|nym"
+)
 
 CEIDG_SEGMENTS = (
     "pergole_altany_tarasy",
@@ -180,6 +194,11 @@ COLUMN_MAP: dict[str, list[str]] = {
     "wojewodztwo": ["wojewodztwo", "województwo", "woj"],
     "powiat": ["powiat", "county"],
     "gmina": ["gmina", "commune"],
+    "opis_dzialalnosci": [
+        "opis dzialalnosci", "opis działalności", "opis_dzialalnosci",
+        "przedmiot dzialalnosci", "przedmiot działalności", "przedmiot_dzialalnosci",
+        "zakres dzialalnosci", "zakres działalności",
+    ],
 }
 
 SEGMENT_RULES: list[tuple[str, list[str], int]] = [
@@ -262,6 +281,17 @@ EXCLUDE_KEYWORDS = re.compile(
 class RunOptions:
     scan_only: bool = False
     allow_spreadsheet: bool = False
+
+
+@dataclass
+class SegmentClassification:
+    segment: str
+    powod: str
+    score: int
+    conflict: bool
+    trafienia_slowa: str
+    trafienia_pola: str
+    podejrzenie_false_positive: str
 
 
 def file_extension(path: Path) -> str:
@@ -711,36 +741,158 @@ def email_looks_technical(email: str) -> bool:
     return bool(TECH_EMAIL_LOCAL_RE.search(local))
 
 
-def classify_segment(blob: str) -> tuple[str, str, int, bool]:
-    """Zwraca segment, powód, wynik, konflikt_segmentów."""
-    if EXCLUDE_KEYWORDS.search(blob):
-        return "poza_grupa", "słowa wykluczające branżę", 0, False
+def _is_word_char(ch: str) -> bool:
+    return bool(ch) and (ch.isalnum() or ch == "_")
+
+
+def _has_valid_inflection_suffix(text: str, end: int) -> bool:
+    remainder = text[end:]
+    if not remainder:
+        return True
+    if not remainder[0].isalpha():
+        return True
+    return bool(re.match(rf"^(?:{POLISH_INFLECTION_SUFFIX})(?=\W|$)", remainder, re.I))
+
+
+def safe_pattern_match(pattern: str, text: str) -> bool:
+    """Dopasowanie z granicą słowa – odrzuca trafienia w nazwiskach typu Tarasiewicz."""
+    if not text:
+        return False
+    for match in re.finditer(pattern, text, re.I):
+        start, end = match.span()
+        if start > 0 and _is_word_char(text[start - 1]):
+            continue
+        if end < len(text) and _is_word_char(text[end]):
+            if not _has_valid_inflection_suffix(text, end):
+                continue
+        return True
+    return False
+
+
+def strip_personal_from_nazwa(nazwa: str, imie: str, nazwisko: str) -> str:
+    result = nazwa or ""
+    for token in (imie, nazwisko):
+        token = (token or "").strip()
+        if len(token) < 2:
+            continue
+        result = re.sub(
+            rf"(?<![\w]){re.escape(token)}(?![\w])",
+            " ",
+            result,
+            flags=re.I,
+        )
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def business_field_texts(rec: dict) -> dict[str, str]:
+    imie = rec.get("imie", "")
+    nazwisko = rec.get("nazwisko", "")
+    nazwa = strip_personal_from_nazwa(rec.get("nazwa_firmy", ""), imie, nazwisko)
+    fields = {
+        "nazwa_firmy": nazwa,
+        "pkd": rec.get("pkd", ""),
+        "pkd_opis": rec.get("pkd_opis", ""),
+        "strona_www": rec.get("strona_www", ""),
+        "opis_dzialalnosci": rec.get("opis_dzialalnosci", ""),
+    }
+    return {name: (value or "").strip() for name, value in fields.items() if (value or "").strip()}
+
+
+def personal_field_text(rec: dict) -> str:
+    parts = [
+        (rec.get("imie", "") or "").strip(),
+        (rec.get("nazwisko", "") or "").strip(),
+    ]
+    return " ".join(p for p in parts if p)
+
+
+def collect_pattern_hits(text: str, field_name: str) -> list[tuple[str, str, str, int]]:
+    hits: list[tuple[str, str, str, int]] = []
+    for seg, patterns, weight in SEGMENT_RULES:
+        for pat in patterns:
+            if safe_pattern_match(pat, text):
+                hits.append((seg, pat, field_name, weight))
+                break
+    return hits
+
+
+def classify_segment(rec: dict) -> SegmentClassification:
+    """Segmentacja wyłącznie na polach branżowych; imię/nazwisko nie punktują."""
+    business_fields = business_field_texts(rec)
+    business_blob = " ".join(business_fields.values())
+    personal_text = personal_field_text(rec)
+
+    if EXCLUDE_KEYWORDS.search(business_blob):
+        return SegmentClassification(
+            segment="poza_grupa",
+            powod="słowa wykluczające branżę",
+            score=0,
+            conflict=False,
+            trafienia_slowa="",
+            trafienia_pola="",
+            podejrzenie_false_positive="nie",
+        )
 
     scores: Counter = Counter()
     reasons: list[str] = []
-    for seg, patterns, weight in SEGMENT_RULES:
-        for pat in patterns:
-            if re.search(pat, blob, re.I):
-                scores[seg] += weight
-                reasons.append(f"{seg}:{pat}")
-                break
+    slowa_hits: list[str] = []
+    pola_hits: list[str] = []
+    personal_only_hits: list[str] = []
+
+    for field_name, field_text in business_fields.items():
+        for seg, pat, hit_field, weight in collect_pattern_hits(field_text, field_name):
+            scores[seg] += weight
+            reasons.append(f"{seg}:{pat}@{hit_field}")
+            slowa_hits.append(pat)
+            pola_hits.append(hit_field)
+
+    if personal_text:
+        unsafe_personal_hits: list[str] = []
+        for seg, patterns, _weight in SEGMENT_RULES:
+            for pat in patterns:
+                if re.search(pat, personal_text, re.I) and not safe_pattern_match(pat, personal_text):
+                    unsafe_personal_hits.append(pat)
+                    break
+        business_patterns = set(slowa_hits)
+        for pat in unsafe_personal_hits:
+            if pat not in business_patterns:
+                personal_only_hits.append(pat)
+
+    podejrzenie = "tak" if personal_only_hits else "nie"
 
     if not scores:
-        return "szeroki_potencjal", "brak wąskiego dopasowania – szeroki potencjał", 0, False
+        return SegmentClassification(
+            segment="szeroki_potencjal",
+            powod="brak wąskiego dopasowania – szeroki potencjał",
+            score=0,
+            conflict=False,
+            trafienia_slowa="",
+            trafienia_pola="",
+            podejrzenie_false_positive=podejrzenie,
+        )
 
     ranked = scores.most_common()
     seg, score = ranked[0]
-    conflict = False
     if len(ranked) > 1 and ranked[1][1] >= score * 0.75 and ranked[1][0] != seg:
-        conflict = True
-        return (
-            "do_sprawdzenia",
-            f"konflikt segmentów: {ranked[0][0]} vs {ranked[1][0]}",
-            score,
-            True,
+        return SegmentClassification(
+            segment="do_sprawdzenia",
+            powod=f"konflikt segmentów: {ranked[0][0]} vs {ranked[1][0]}",
+            score=score,
+            conflict=True,
+            trafienia_slowa="; ".join(dict.fromkeys(slowa_hits)),
+            trafienia_pola="; ".join(dict.fromkeys(pola_hits)),
+            podejrzenie_false_positive=podejrzenie,
         )
 
-    return seg, "; ".join(reasons[:3]), score, conflict
+    return SegmentClassification(
+        segment=seg,
+        powod="; ".join(reasons[:3]),
+        score=score,
+        conflict=False,
+        trafienia_slowa="; ".join(dict.fromkeys(slowa_hits)),
+        trafienia_pola="; ".join(dict.fromkeys(pola_hits)),
+        podejrzenie_false_positive=podejrzenie,
+    )
 
 
 def assign_priority(segment: str) -> str:
@@ -811,6 +963,23 @@ def to_brevo_row(rec: dict) -> dict:
     }
 
 
+def to_priority_audit_row(rec: dict) -> dict:
+    return {
+        "email": rec.get("email", ""),
+        "nazwa_firmy": rec.get("nazwa_firmy", ""),
+        "imie": rec.get("imie", ""),
+        "nazwisko": rec.get("nazwisko", ""),
+        "segment": rec.get("segment", ""),
+        "priorytet": rec.get("priorytet", ""),
+        "priorytet_score": rec.get("priorytet_score", ""),
+        "priorytet_segment": rec.get("priorytet_segment", ""),
+        "priorytet_powody": rec.get("priorytet_powody", ""),
+        "trafienia_slowa": rec.get("trafienia_slowa", ""),
+        "trafienia_pola": rec.get("trafienia_pola", ""),
+        "podejrzenie_false_positive": rec.get("podejrzenie_false_positive", ""),
+    }
+
+
 def is_brevo_exportable(rec: dict) -> bool:
     if rec.get("priorytet") not in ("A", "B", "C"):
         return False
@@ -859,6 +1028,7 @@ def row_from_raw(raw: dict, mapping: dict[str, str], source_file: str) -> list[d
         "strona_www": get("strona_www"),
         "pkd": get("pkd"),
         "pkd_opis": get("pkd_opis"),
+        "opis_dzialalnosci": get("opis_dzialalnosci"),
         "adres": get("adres"),
         "kod_pocztowy": get("kod_pocztowy"),
         "miejscowosc": get("miejscowosc"),
@@ -869,11 +1039,11 @@ def row_from_raw(raw: dict, mapping: dict[str, str], source_file: str) -> list[d
         "status_marketingowy": "potencjalny_klient_ceidg",
         "_source_file": source_file,
     }
-    blob = " ".join([
-        nazwa, base["pkd"], base["pkd_opis"], base["strona_www"], base["miejscowosc"],
-        base["telefon"],
-    ])
-    segment, powod, score, conflict = classify_segment(blob)
+    classification = classify_segment(base)
+    segment = classification.segment
+    powod = classification.powod
+    score = classification.score
+    conflict = classification.conflict
     priorytet = assign_priority(segment)
 
     if not emails:
@@ -890,6 +1060,12 @@ def row_from_raw(raw: dict, mapping: dict[str, str], source_file: str) -> list[d
             "segment": segment,
             "priorytet": priorytet,
             "powod_segmentacji": powod,
+            "priorytet_score": score,
+            "priorytet_segment": segment,
+            "priorytet_powody": powod,
+            "trafienia_slowa": classification.trafienia_slowa,
+            "trafienia_pola": classification.trafienia_pola,
+            "podejrzenie_false_positive": classification.podejrzenie_false_positive,
             "uwagi": uwagi,
             "ceidg_id": make_ceidg_id(nip, nazwa, em),
             "_segment_conflict": conflict,
@@ -921,9 +1097,9 @@ def write_report(stats: dict) -> None:
     export_b = stats.get("export_b", 0)
     export_c = stats.get("export_c", 0)
     if export_a >= 50:
-        first_import = "BREVO-CEIDG-TEST-050.csv (partia testowa priorytet A/B)"
+        first_import = "BREVO-CEIDG-TEST-050-v2.csv (partia testowa priorytet A/B)"
     elif stats.get("brevo_export", 0) > 0:
-        first_import = "BREVO-CEIDG-TEST-050.csv"
+        first_import = "BREVO-CEIDG-TEST-050-v2.csv"
     else:
         first_import = "brak danych do importu"
 
@@ -938,7 +1114,7 @@ def write_report(stats: dict) -> None:
     if stats.get("brevo_export", 0) == 0 and stats.get("valid_emails", 0) > 0:
         quality.append("Są poprawne e-maile, ale brak eksportu – sprawdź priorytety i segmenty.")
     if not quality:
-        quality.append("Rozpocznij od BREVO-CEIDG-TEST-050.csv, potem rozszerzaj partiami.")
+        quality.append("Rozpocznij od BREVO-CEIDG-TEST-050-v2.csv, potem rozszerzaj partiami.")
 
     processed = stats.get("processed_files") or []
     processed_line = ", ".join(processed) if processed else "brak"
@@ -965,8 +1141,9 @@ def write_report(stats: dict) -> None:
         f"| Priorytet X | {stats.get('priority_x', 0)} |\n"
         f"| Do sprawdzenia | {stats.get('review_count', 0)} |\n"
         f"| Eksport BREVO-CEIDG-001.csv | {stats.get('brevo_export', 0)} |\n"
-        f"| TEST-050 | {stats.get('test_050', 0)} |\n"
-        f"| TEST-100 | {stats.get('test_100', 0)} |\n"
+        f"| TEST-050-v2 | {stats.get('test_050', 0)} |\n"
+        f"| TEST-100-v2 | {stats.get('test_100', 0)} |\n"
+        f"| Podejrzenia false positive | {stats.get('false_positive_suspicion', 0)} |\n"
         f"| A-001 | {export_a} |\n"
         f"| B-001 | {export_b} |\n"
         f"| C-001 | {export_c} |\n"
@@ -980,7 +1157,7 @@ def write_report(stats: dict) -> None:
         f"## Ostrożność przy kampanii CEIDG\n\n"
         f"- CEIDG jest **osobnym źródłem** – nie mieszać z klientami Google/SMS/e-mail.\n"
         f"- Wysyłka masowa B2B wymaga ostrożności prawnej (identyfikacja nadawcy, podstawa kontaktu).\n"
-        f"- Kampanię testuj na **małej partii** (TEST-050, potem TEST-100).\n"
+        f"- Kampanię testuj na **małej partii** (TEST-050-v2, potem TEST-100-v2).\n"
         f"- Wiadomość musi mieć **jasną identyfikację nadawcy** Footing.\n"
         f"- Musi być **prosty sposób wypisania / sprzeciwu** (link lub odpowiedź).\n"
         f"- **Nie wysyłać całej bazy naraz** – stopniowe rozszerzanie po analizie bounce/unsubscribe.\n",
@@ -1113,12 +1290,26 @@ def process_ceidg(options: RunOptions) -> dict:
 
     clean_for_file = [{k: v for k, v in r.items() if not k.startswith("_")} for r in clean_rows]
     clean_for_file.sort(key=brevo_sort_key)
+    audit_rows = [to_priority_audit_row(r) for r in clean_rows]
+    audit_rows.sort(key=brevo_sort_key)
+    false_positive_count = sum(
+        1 for r in clean_rows if r.get("podejrzenie_false_positive") == "tak"
+    )
 
     write_csv(CEIDG_OUTPUT / "CEIDG-CZYSTE.csv", CEIDG_CLEAN_COLS, clean_for_file)
     write_csv(CEIDG_KONTROLA / "CEIDG-DO-SPRAWDZENIA.csv", REVIEW_COLS, review_rows)
     write_csv(MARKETING_OUT / "BREVO-CEIDG-001.csv", BREVO_CEIDG_COLS, brevo_all)
-    write_csv(MARKETING_OUT / "BREVO-CEIDG-TEST-050.csv", BREVO_CEIDG_COLS, [to_brevo_row(r) for r in test_050])
-    write_csv(MARKETING_OUT / "BREVO-CEIDG-TEST-100.csv", BREVO_CEIDG_COLS, [to_brevo_row(r) for r in test_100])
+    write_csv(
+        MARKETING_OUT / "BREVO-CEIDG-TEST-050-v2.csv",
+        BREVO_CEIDG_COLS,
+        [to_brevo_row(r) for r in test_050],
+    )
+    write_csv(
+        MARKETING_OUT / "BREVO-CEIDG-TEST-100-v2.csv",
+        BREVO_CEIDG_COLS,
+        [to_brevo_row(r) for r in test_100],
+    )
+    write_csv(MARKETING_OUT / "CEIDG-PRIORYTET-AUDYT.csv", PRIORITY_AUDIT_COLS, audit_rows)
     write_csv(MARKETING_OUT / "BREVO-CEIDG-A-001.csv", BREVO_CEIDG_COLS, brevo_a)
     write_csv(MARKETING_OUT / "BREVO-CEIDG-B-001.csv", BREVO_CEIDG_COLS, brevo_b)
     write_csv(MARKETING_OUT / "BREVO-CEIDG-C-001.csv", BREVO_CEIDG_COLS, brevo_c)
@@ -1148,6 +1339,7 @@ def process_ceidg(options: RunOptions) -> dict:
         "export_a": len(brevo_a),
         "export_b": len(brevo_b),
         "export_c": len(brevo_c),
+        "false_positive_suspicion": false_positive_count,
         "segment_counts": segment_counts,
         "elapsed_seconds": elapsed,
     }
@@ -1208,8 +1400,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Priorytet X:             {stats['priority_x']}")
         print(f"Do sprawdzenia:          {stats.get('review_count', 0)}")
         print(f"BREVO-CEIDG-001:         {stats['brevo_export']}")
-        print(f"TEST-050:                {stats.get('test_050', 0)}")
-        print(f"TEST-100:                {stats.get('test_100', 0)}")
+        print(f"TEST-050-v2:             {stats.get('test_050', 0)}")
+        print(f"TEST-100-v2:             {stats.get('test_100', 0)}")
+        print(f"False positive (audyt):  {stats.get('false_positive_suspicion', 0)}")
         print(f"Czas przetwarzania:      {stats.get('elapsed_seconds', 0):.1f} s")
         print()
         print("Segmenty (rekordy z e-mailem):")
