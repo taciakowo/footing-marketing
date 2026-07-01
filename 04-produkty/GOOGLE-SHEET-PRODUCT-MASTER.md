@@ -44,8 +44,8 @@ Bez flag uruchamia pełny pipeline odczytu (wartości + formuły + walidacje + a
 ### Tryb A – Google Sheets API
 
 1. Wartości obliczone / widoczne (`valueRenderOption=FORMATTED_VALUE`).
-2. Formuły (`valueRenderOption=FORMULA`).
-3. Walidacje / listy rozwijane (`spreadsheets.get` + `includeGridData`).
+2. Formuły (`spreadsheets.get` + `includeGridData` → `userEnteredValue.formulaValue`).
+3. Walidacje / listy rozwijane (`includeGridData` → `dataValidation`).
 4. Dla list opartych o zakres – zapis `source_range` i pobranie wartości źródłowych.
 
 Credentials (prywatne, poza Git): `00-inbox/google_credentials.json`, token: `00-inbox/google_token_sheets.json`.
@@ -54,16 +54,19 @@ Scope: `spreadsheets.readonly`.
 
 ### Stan integracji (2026-07)
 
-Google Sheets API jest **włączone i działa częściowo**:
+Google Sheets API **działa** (`source_mode: api`). Odczyt read-only obejmuje wartości, formuły i walidacje:
 
-| Komenda | Wynik |
-|---------|--------|
-| `--snapshot-only` | OK — 142 produkty, 112 kolumn → `PRODUKTY-GOOGLE-SHEET-VALUES.csv` |
-| `--inspect-validations` | OK — 852 walidacji / list rozwijanych |
-| `--export-woo` | OK — `PRODUKTY-WOO-EXPORT.csv` (roboczy) |
-| `--inspect-formulas` | **Problem otwarty** — 0 wykrytych formuł; wymaga poprawki odczytu |
+| Komenda | Wynik | Plik prywatny |
+|---------|--------|---------------|
+| `--snapshot-only` | OK — 142 produkty, 112 kolumn | `PRODUKTY-GOOGLE-SHEET-VALUES.csv` |
+| `--inspect-formulas` | OK — 2840 formuł | `PRODUKTY-GOOGLE-SHEET-FORMULAS.csv` |
+| `--inspect-validations` | OK — 852 walidacji / list rozwijanych | `PRODUKTY-GOOGLE-SHEET-VALIDATIONS.csv` |
+| `--export-woo` | OK | `PRODUKTY-WOO-EXPORT.csv` |
 
-Warstwa wartości i walidacji jest operacyjna. Warstwa formuł wymaga dopracowania w module — bez niej audyt nie rozróżnia poprawnie pustych komórek od komórek z formułą o pustym wyniku.
+Metoda formuł: `spreadsheets.get` + `includeGridData` + `userEnteredValue.formulaValue`.
+Diagnostyka zakresu: `inspected_cells_count: 8348`.
+
+Następny etap produktowy: **porównanie ze sklepem WooCommerce** i akceptacja diff przed ewentualną publikacją.
 
 ### Tryb B – lokalny CSV (`--input-csv`)
 
@@ -88,7 +91,29 @@ Snapshoty prywatne używają separatora **`;`** w CSV (`Import-Csv ... -Delimite
 
 ## WooCommerce
 
-WooCommerce jest **miejscem publikacji**, nie źródłem prawdy. Eksport `PRODUKTY-WOO-EXPORT.csv` służy do weryfikacji przed ręczną lub przyszłą synchronizacją. Adapter REST: `07-integracje/woocommerce/`.
+WooCommerce jest **miejscem publikacji**, nie źródłem prawdy.
+
+Etap 1 połączenia ze sklepem (read-only): `01-system/woo_product_sync.py`
+
+```powershell
+python 01-system\woo_product_sync.py --fetch-woo
+python 01-system\woo_product_sync.py --compare
+python 01-system\woo_product_sync.py --dry-run --limit 5
+```
+
+| Etap | Plik prywatny | Zapis do sklepu |
+|------|---------------|-----------------|
+| Snapshot Woo | `PRODUKTY-WOO-REMOTE-SNAPSHOT.csv` | Nie |
+| Diff Sheet ↔ Woo | `PRODUKTY-WOO-DIFF.csv`, `.md` | Nie |
+| Dry-run aktualizacji | `PRODUKTY-WOO-UPDATE-DRY-RUN.json` | Nie |
+
+Roboczy eksport z arkusza (`PRODUKTY-WOO-EXPORT.csv`) służy do weryfikacji mapowania pól. **Aktualizacja sklepu nastąpi dopiero po akceptacji diff i dry-run.**
+
+Zdjęcia i rysunki: na tym etapie standardowy mechanizm WooCommerce (URL / nazwa pliku w arkuszu). Automatyczny upload mediów jest odłożony.
+
+Credentials Woo (prywatne): `00-inbox/woo_credentials.json` — wzór: `07-integracje/woocommerce/woo_credentials.example.json`
+
+Dokumentacja adaptera: [07-integracje/woocommerce/README.md](../07-integracje/woocommerce/README.md)
 
 ## Audyt braków
 

@@ -1,6 +1,6 @@
 # Struktura plików Footing System
 
-Wygenerowano: audyt architektury (2026-07-01, korekta statusu Sheets).  
+Wygenerowano: audyt architektury (2026-07-01, status Sheets — formuły OK).
 Repozytorium: `https://github.com/taciakowo/footing-system.git` · gałąź: `main`.
 
 Projekt wyrósł z wcześniejszego `footing-marketing`; obecna nazwa repo i folderu lokalnego to **`footing-system`**.
@@ -13,11 +13,12 @@ Moduł: `01-system/product_sheet_sync.py` · zakładka `baza_produktow_footing`.
 
 | Warstwa | Status |
 |---------|--------|
-| Google Sheets API | Włączone, działa (read-only) |
-| `--snapshot-only` | OK — 142 produkty, 112 kolumn |
-| `--inspect-validations` | OK — 852 walidacji / list rozwijanych |
-| `--export-woo` | OK — `PRODUKTY-WOO-EXPORT.csv` |
-| `--inspect-formulas` | **Do dopracowania** — obecnie 0 wykrytych formuł |
+| Google Sheets API | Działa (`source_mode: api`, read-only) |
+| `--snapshot-only` | OK — 142 produkty, 112 kolumn → VALUES |
+| `--inspect-formulas` | OK — 2840 formuł (`userEnteredValue.formulaValue`) → FORMULAS |
+| `--inspect-validations` | OK — 852 walidacji → VALIDATIONS |
+| `--export-woo` | OK → WOO-EXPORT |
+| Diagnostyka | `inspected_cells_count: 8348` |
 
 Snapshoty prywatne: separator CSV **`;`** (`Import-Csv ... -Delimiter ';'`).
 

@@ -20,6 +20,8 @@ Kody produktów, warianty, zastosowania, grupy produktowe.
 
 `01-system/product_sheet_sync.py` – snapshot wartości, formuł, walidacji, audyt braków, roboczy eksport Woo.
 
+Stan integracji (2026-07): API OK · 142 produkty · 2840 formuł · 852 walidacji · separator CSV `;`.
+
 ## Powiązania
 
 - Parser zamówień z nazw kontaktu: `01-system/update_footing_database.py`

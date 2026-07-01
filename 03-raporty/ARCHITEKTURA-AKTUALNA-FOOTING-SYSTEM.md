@@ -135,15 +135,16 @@ Projekt **wyrósł z wcześniejszego repozytorium `footing-marketing`**, ale obe
 
 **Stan integracji Google Sheets API (2026-07):**
 
-| Warstwa | Status | Uwagi |
-|---------|--------|-------|
-| OAuth + API | **Włączone, działa** | Token `google_token_sheets.json`, scope read-only |
+| Warstwa | Status | Metryka / plik |
+|---------|--------|----------------|
+| OAuth + API | **Działa** | `source_mode: api`, token read-only |
 | Wartości (`--snapshot-only`) | **Działa** | 142 produkty, 112 kolumn → `PRODUKTY-GOOGLE-SHEET-VALUES.csv` |
-| Walidacje (`--inspect-validations`) | **Działa** | 852 walidacji / list rozwijanych |
+| Formuły (`--inspect-formulas`) | **Działa** | 2840 formuł (`spreadsheets.get` + `includeGridData` + `userEnteredValue.formulaValue`) → `PRODUKTY-GOOGLE-SHEET-FORMULAS.csv` |
+| Walidacje (`--inspect-validations`) | **Działa** | 852 walidacji / list rozwijanych → `PRODUKTY-GOOGLE-SHEET-VALIDATIONS.csv` |
 | Eksport Woo (`--export-woo`) | **Działa** | `PRODUKTY-WOO-EXPORT.csv` (roboczy, bez publikacji) |
-| Formuły (`--inspect-formulas`) | **Do dopracowania** | Obecnie 0 wykrytych formuł — wymaga poprawki diagnostyki/odczytu |
+| Diagnostyka zakresu | — | `inspected_cells_count: 8348` |
 
-Warstwa **wartości i walidacji** jest operacyjna. Warstwa **formuł** wymaga dalszej pracy w module — bez niej audyt nie rozróżnia poprawnie pustych komórek od komórek z formułą o pustym wyniku.
+Snapshoty prywatne: separator CSV **`;`**. Wszystkie cztery pliki produktowe (VALUES, FORMULAS, VALIDATIONS, WOO-EXPORT) są tworzone poprawnie.
 
 ---
 
@@ -236,7 +237,7 @@ flowchart LR
 2. **SMS/e-mail → bufor:** ten sam orchestrator wykrywa sygnały handlowe → `bufor/BUFOR-*.csv` (bez automatycznej akceptacji).
 3. **Quick Order → bufor:** `quick_order_events.py` → quick-order → merge w update → bufor.
 4. **CEIDG → Brevo CSV:** `prepare_ceidg_mailing.py` – osobny tor, `zrodlo=ceidg`, listy testowe **v2** po poprawce priorytetu (nie stare TEST-050/100).
-5. **Google Sheet produkty → audyt/eksport:** `product_sheet_sync.py` – wartości i walidacje działają; formuły wymagają poprawki → audyt braków (ograniczony) → `PRODUKTY-WOO-EXPORT.csv` (bez auto-publikacji).
+5. **Google Sheet produkty → audyt/eksport:** `product_sheet_sync.py` – wartości, formuły i walidacje → audyt braków → `PRODUKTY-WOO-EXPORT.csv` (bez auto-publikacji).
 6. **Produkty → wysyłki:** `shipping_export.py` używa pozycji zamówień i słownika gabarytów (`KLUCZ-WYSYLKOWY.csv`) – powiązanie przez kody produktów/SKU.
 7. **Zamówienia → wysyłki:** po zaakceptowanych zamówieniach, adresach i danych kontaktowych.
 
@@ -314,12 +315,12 @@ Panel (`10-footing-panel/`): **Klienci | Zamówienia | Produkty (read) | Bufor**
 | Rozrost `01-system/` | 13 plików, jeden orchestrator ~2200 linii | Biblioteki wydzielone; dokumentacja audytu |
 | Mieszanie marketingu z CRM | CEIDG vs KLIENCI | Osobne foldery output, `zrodlo`, brak merge |
 | Produkty vs wysyłki | Gabaryty w KLUCZ-WYSYLKOWY vs Sheet | SKU jako łącznik; docelowo parametry z Sheet |
-| Utrata logiki formuł Sheet | Eksport tylko VALUES; odczyt formuł zwraca 0 | **Częściowo opanowane** — walidacje czytane (852); formuły wymagają poprawy w `product_sheet_sync.py` |
+| Utrata logiki formuł Sheet | Spłaszczenie arkusza do samego CSV VALUES | **Opanowane na poziomie odczytu** (2840 formuł); następny etap: walidacja mapowania pól do WooCommerce |
 | Ręczna praca w CSV | Panel jeszcze nie ma | Bufor + DO-SPRAWDZENIA |
 | Nadpisywanie Google | Stary monolit Apps Script | Footing read-only; `google-contacts-write` tylko docs |
 | Import całej bazy do Brevo | Setki tys. CEIDG | TEST-050-v2, TEST-100-v2, partiami |
 | Spójność SKU–zdjęcie–rysunek | Brak folderu assetów | Kolumny image_main, drawing w Sheet + audyt |
-| Sheets API | Sync produktów | **Włączone** — wartości i walidacje OK; formuły do dopracowania |
+| Sheets API | Sync produktów | **Włączone** — wartości, formuły (2840), walidacje (852) OK |
 
 ---
 
@@ -327,7 +328,7 @@ Panel (`10-footing-panel/`): **Klienci | Zamówienia | Produkty (read) | Bufor**
 
 ### Teraz
 
-1. **Dokończyć poprawkę odczytu formuł** w `product_sheet_sync.py` i dopiero potem commitować moduł produktowy jako stabilny.
+1. **Commit modułu produktowego** (`product_sheet_sync.py` + dokumentacja `04-produkty/`) po akceptacji odczytu formuł.
 2. Mailing CEIDG: używać **TEST-050-v2 / TEST-100-v2**, nie starych list.
 3. Utrzymać `.gitignore` dla `00-inbox/`, `02-output-private/` – kontrola ok.
 4. Zatwierdzić raport audytu w Git (bez prywatnych plików).
@@ -349,10 +350,8 @@ Panel (`10-footing-panel/`): **Klienci | Zamówienia | Produkty (read) | Bufor**
 1. Panel (`10-footing-panel/`) – MVP Klienci + Zamówienia.
 2. WooCommerce API read-only (`07-integracje/woocommerce/`).
 3. aPaczka API po stabilizacji CSV.
-4. WooCommerce API read-only (`07-integracje/woocommerce/`).
-5. aPaczka API po stabilizacji CSV.
-6. Migracja treści `05-kampanie/`, `06-landingi/` → `06-marketing/`.
-7. Rozbicie `01-system/` na podpakiety.
+4. Migracja treści `05-kampanie/`, `06-landingi/` → `06-marketing/`.
+5. Rozbicie `01-system/` na podpakiety.
 
 ---
 
@@ -382,7 +381,7 @@ Panel (`10-footing-panel/`): **Klienci | Zamówienia | Produkty (read) | Bufor**
 7. **Google Contacts write:** Czy kiedykolwiek write-back, czy na stałe read-only?
 8. **SQLite:** Czy w ogóle planowany, czy CSV pozostaje źródłem operacyjnym do panelu?
 9. **Monolit Apps Script:** Co zachować z `08-legacy-audit/` (formuły, segmenty), a co wyrzucić?
-10. **Formuły Sheet:** Po poprawce odczytu — czy audyt braków ma traktować puste wyniki formuł jako ostrzeżenia?
+10. **Mapowanie Woo:** Czy `PRODUKTY-WOO-EXPORT.csv` wymaga dodatkowych pól przed pierwszą publikacją?
 
 ---
 
